@@ -94,7 +94,10 @@ def plot_accuracies(train_acc_i, train_acc_t, val_acc_i, val_acc_t):
 
 def train_and_validate(model, train_dataloader, val_dataloader):
     tokenizer = SimpleTokenizer()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), 
+                                  lr=LEARNING_RATE, 
+                                  weight_decay=1e-5,
+                                 betas=(0.9, 0.98))
     train_acc_i_list, train_acc_t_list = [], []
     val_acc_i_list, val_acc_t_list = [], []
 
