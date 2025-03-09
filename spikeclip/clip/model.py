@@ -95,7 +95,7 @@ class AttentionPool2d(nn.Module):
             bias_k=None,
             bias_v=None,
             add_zero_attn=False,
-            dropout_p=0,
+            dropout_p=0.1,
             out_proj_weight=self.c_proj.weight,
             out_proj_bias=self.c_proj.bias,
             use_separate_proj_weight=True,
@@ -130,11 +130,8 @@ class ModifiedResNet(nn.Module):
         # Residual layers
         self._inplanes = width
         self.layer1 = self._make_layer(width, layers[0])
-        self.dropout1 = nn.Dropout2d(0.2)
         self.layer2 = self._make_layer(width * 2, layers[1], stride=2)
-        self.dropout2 = nn.Dropout2d(0.2)
         self.layer3 = self._make_layer(width * 4, layers[2], stride=2)
-        self.dropout3 = nn.Dropout2d(0.2)
         self.layer4 = self._make_layer(width * 8, layers[3], stride=2)
 
         # Attention Pooling
