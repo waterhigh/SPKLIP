@@ -389,7 +389,7 @@ class ResNetWithTransformer(nn.Module):
         self.win_r = 30  # 窗口半径
         self.win_step = 45  # 窗口步长
 
-        self.ted_adapter = TEDAdapter(d_model=frame_feature_dim)
+        # self.ted_adapter = TEDAdapter(d_model=frame_feature_dim)
 
 
     def forward(self, video_frames):
