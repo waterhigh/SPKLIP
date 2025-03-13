@@ -6,7 +6,167 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
+import torchinfo
+# from spike_T import MS_DownSampling, MS_Attention_linear, MultiSpike
 # from align_arch import *
+
+class MS_DownSampling(nn.Module):
+    def __init__(
+        self,
+        in_channels=2,
+        embed_dims=256,
+        kernel_size=3,
+        stride=2,
+        padding=1,
+        first_layer=True,
+        T=None,
+    ):
+        super().__init__()
+        self.encode_conv = nn.Conv1d(
+            in_channels,
+            embed_dims,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+        )
+        self.encode_bn = nn.BatchNorm1d(embed_dims)
+        self.first_layer = first_layer
+        if not first_layer:
+            self.encode_spike = MultiSpike()
+
+    def forward(self, x):
+        # 输入x形状为 [B, D, T]
+        if hasattr(self, "encode_spike"):
+            x = self.encode_spike(x)
+        x = self.encode_conv(x)  # [B, D, T] → [B, embed_dims, T']
+        x = self.encode_bn(x)
+        return x
+
+
+class MS_Attention_linear(nn.Module):
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        lamda_ratio=1,
+    ):
+        super().__init__()
+        assert (
+            dim % num_heads == 0
+        ), f"dim {dim} should be divided by num_heads {num_heads}."
+        self.dim = dim
+        self.num_heads = num_heads
+        self.scale = (dim//num_heads) ** -0.5
+        self.lamda_ratio = lamda_ratio
+
+        self.head_spike = MultiSpike()
+
+        # 将Conv2d替换为Conv1d，BatchNorm2d替换为BatchNorm1d
+        self.q_conv = nn.Sequential(
+            nn.Conv1d(dim, dim, 1, 1, bias=False), 
+            nn.BatchNorm1d(dim)
+        )
+        self.q_spike = MultiSpike()
+
+        self.k_conv = nn.Sequential(
+            nn.Conv1d(dim, dim, 1, 1, bias=False), 
+            nn.BatchNorm1d(dim)
+        )
+        self.k_spike = MultiSpike()
+
+        self.v_conv = nn.Sequential(
+            nn.Conv1d(dim, int(dim*lamda_ratio), 1, 1, bias=False), 
+            nn.BatchNorm1d(int(dim*lamda_ratio))
+        )
+        self.v_spike = MultiSpike()
+
+        self.attn_spike = MultiSpike()
+
+        # 修改proj_conv的输入通道为dim*lamda_ratio
+        self.proj_conv = nn.Sequential(
+            nn.Conv1d(dim*lamda_ratio, dim, 1, 1, bias=False), 
+            nn.BatchNorm1d(dim)
+        )
+
+    def forward(self, x):
+        B, C, T = x.shape  # 输入形状改为 [B, C, T]
+        C_v = int(C * self.lamda_ratio)
+
+        x = self.head_spike(x)  # [B, C, T]
+
+        # 生成Q/K/V
+        q = self.q_conv(x)  # [B, C, T]
+        k = self.k_conv(x)
+        v = self.v_conv(x)  # [B, C_v, T]
+
+        q = self.q_spike(q).permute(0, 2, 1)  # [B, T, C]
+        k = self.k_spike(k).permute(0, 2, 1)
+        v = self.v_spike(v).permute(0, 2, 1)  # [B, T, C_v]
+
+        # 多头切分
+        q = q.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2)  # [B, heads, T, C//heads]
+        k = k.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, C_v // self.num_heads).transpose(1, 2)
+
+        # 计算注意力
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, heads, T, T]
+        attn = self.attn_spike(attn)
+        x = attn @ v  # [B, heads, T, C_v//heads]
+
+        # 合并多头
+        x = x.transpose(1, 2).reshape(B, T, C_v)  # [B, T, C_v]
+        x = x.permute(0, 2, 1)  # [B, C_v, T]
+
+        # 投影回原始维度
+        x = self.proj_conv(x)  # [B, C, T]
+        return x
+
+class Quant(torch.autograd.Function):
+    @staticmethod
+    @torch.cuda.amp.custom_fwd
+    def forward(ctx, i, min_value, max_value):
+        ctx.min = min_value
+        ctx.max = max_value
+        ctx.save_for_backward(i)
+        return torch.round(torch.clamp(i, min=min_value, max=max_value))
+
+    @staticmethod
+    @torch.cuda.amp.custom_fwd
+    def backward(ctx, grad_output):
+        grad_input = grad_output.clone()
+        i, = ctx.saved_tensors
+        grad_input[i < ctx.min] = 0
+        grad_input[i > ctx.max] = 0
+        return grad_input, None, None
+    
+
+class MultiSpike(nn.Module):
+    def __init__(
+        self,
+        min_value=0,
+        max_value=4,
+        Norm=None,
+        ):
+        super().__init__()
+        if Norm == None:
+            self.Norm = max_value
+        else:
+            self.Norm = Norm
+        self.min_value = min_value
+        self.max_value = max_value
+    
+    @staticmethod
+    def spike_function(x, min_value, max_value):
+        return Quant.apply(x, min_value, max_value)
+        
+    def __repr__(self):
+        return f"MultiSpike(Max_Value={self.max_value}, Min_Value={self.min_value}, Norm={self.Norm})"     
+
+    def forward(self, x): # B C H W
+        return self.spike_function(x, min_value=self.min_value, max_value=self.max_value) / (self.Norm)
+    
+
+
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -54,6 +214,122 @@ class Bottleneck(nn.Module):
         out += identity
         out = self.relu3(out)
         return out
+
+class TemporalSpikingTransformer(nn.Module):
+    def __init__(
+        self,
+        input_dim=128,          # 输入特征维度 D
+        embed_dim=512,           # 嵌入维度
+        num_heads=8,            # 注意力头数
+        num_blocks=6,           # Transformer块数量
+        mlp_ratio=4,            # MLP扩展比例
+        lamda_ratio=1,          # V通道扩展比例
+        dropout=0.1            # 通用dropout率    
+    ):
+        super().__init__()
+        
+        # 1. 下采样层（已适配时序数据）
+        self.downsample = MS_DownSampling(
+            in_channels=input_dim,
+            embed_dims=embed_dim,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            first_layer=True
+        )
+        
+        # 2. 构建多阶段脉冲Transformer块
+        self.blocks = nn.ModuleList([
+            MS_Block_Spike_SepConv(
+                dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                lamda_ratio=lamda_ratio,
+                dropout=dropout
+            ) for _ in range(num_blocks)
+        ])
+        
+        # 3. 全局时序池化
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        
+
+    def forward(self, x):
+        # 输入处理：[B, T, D] → [B, D, T]
+        x = x.permute(0, 2, 1).contiguous()  # 转为3D
+        
+        # 下采样：[B, D, T] → [B, embed_dim, T]
+        # print(f"Before downsample: {x.shape}")
+        x = self.downsample(x)
+        # print(f"After downsample: {x.shape}")
+        # 多阶段处理（保持3D格式）
+        for blk in self.blocks:
+            x = blk(x)
+            
+        # 全局池化：[B, embed_dim, T] → [B, embed_dim]
+        x = self.global_pool(x).squeeze(-1)
+        return x
+
+# 已适配时序数据的脉冲Transformer块
+class MS_Block_Spike_SepConv(nn.Module):
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        mlp_ratio=4,
+        lamda_ratio=1,
+        dropout=0.1
+    ):
+        super().__init__()
+        
+        # 脉冲深度可分离卷积（时序维度）
+        self.conv = nn.Sequential(
+            nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
+            nn.BatchNorm1d(dim),
+            MultiSpike(Norm=dim)
+        )
+        
+        # 已修改的脉冲线性注意力
+        self.attn = MS_Attention_linear(
+            dim=dim,
+            num_heads=num_heads,
+            lamda_ratio=lamda_ratio
+        )
+        
+        # 脉冲MLP
+        self.mlp = nn.Sequential(
+            nn.Conv1d(dim, int(dim*mlp_ratio), kernel_size=1),
+            nn.BatchNorm1d(int(dim*mlp_ratio)),
+            MultiSpike(Norm=int(dim*mlp_ratio)),
+            nn.Dropout(dropout),
+            nn.Conv1d(int(dim*mlp_ratio), dim, kernel_size=1),
+            nn.BatchNorm1d(dim),
+            MultiSpike(Norm=dim)
+        )
+        
+        # 层归一化
+        self.norm1 = nn.BatchNorm1d(dim)
+        self.norm2 = nn.BatchNorm1d(dim)
+        self.norm3 = nn.BatchNorm1d(dim)
+
+    def forward(self, x):
+        # 局部特征提取（卷积路径）
+        conv_x = self.conv(x)
+        x = x + conv_x
+        x = self.norm1(x)
+        
+        # 全局注意力（时序维度）
+        attn_x = self.attn(x)  # 适配修改后的MS_Attention_linear
+        x = x + attn_x
+        x = self.norm2(x)
+        
+        # 非线性增强（MLP路径）
+        mlp_x = self.mlp(x)
+        x = x + mlp_x
+        x = self.norm3(x)
+        
+        return x
+
+
 
 class AttentionPool2d(nn.Module):
     def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
@@ -220,59 +496,6 @@ class CALayer2(nn.Module):
         weight = self.ca_block(x)
         return weight
     
-class TEDAdapter(nn.Module):
-    def __init__ (self, d_model, reduction=4):
-        super().__init__()
-        self.d_model = d_model
-        self.reduction = reduction 
-    # 全局时间增强模块 (Temporal Enhancement)
-        self.te_conv = nn.Conv1d(
-        in_channels=d_model,
-        out_channels=d_model,
-        kernel_size=3,
-        padding=1,
-        groups=d_model  # 深度可分离卷积
-    )
-    
-    # 局部时间差分模块 (Temporal Difference)
-        self.td_conv = nn.Conv2d(
-        in_channels=d_model,
-        out_channels=d_model,
-        kernel_size=3,
-        padding=1,
-        groups=d_model  # 深度可分离卷积
-    )
-    
-    # 通道注意力
-        self.ca = nn.Sequential(
-        nn.AdaptiveAvgPool2d(1),
-        nn.Conv2d(d_model, d_model//reduction, 1),
-        nn.ReLU(),
-        nn.Conv2d(d_model//reduction, d_model, 1),
-        nn.Sigmoid()
-    )
-    def forward(self, x):
-        B, T, D = x.shape
-        
-        # 全局时间卷积（保持原逻辑）
-        te_out = self.te_conv(x.permute(0,2,1)).permute(0,2,1)
-        
-        # 局部时间差分（保持原逻辑）
-        x_diff = x[:,1:] - x[:,:-1]
-        x_diff = F.pad(x_diff, (0,0,0,1))  # 保持时间维度
-        
-        # 修改空间处理方式（关键改动）
-        # 假设特征维度D可以分解为1x1的空间结构
-        td_out = self.td_conv(
-            x_diff.view(B*T, D, 1, 1)  # 修改为1x1的空间维度
-        ).view(B, T, D)
-        
-        # 通道注意力（调整reshape方式）
-        attn = self.ca(
-            (te_out + td_out).view(B*T, D, 1, 1)  # 修改为1x1的空间维度
-        ).view(B, T, D)
-        
-        return x + attn * (te_out + td_out)
 
 class FeatureExtractor(nn.Module):
     def __init__(
@@ -389,6 +612,12 @@ class ResNetWithTransformer(nn.Module):
         self.win_r = 30  # 窗口半径
         self.win_step = 45  # 窗口步长
 
+        self.temporal_transformer = TemporalSpikingTransformer(
+            input_dim=frame_feature_dim,          # 输入特征维度（与ResNet输出的D一致）
+            embed_dim=512,         # 根据需求调整
+            num_heads=4,
+            num_blocks=6  
+        )
         # self.ted_adapter = TEDAdapter(d_model=frame_feature_dim)
 
 
@@ -430,21 +659,14 @@ class ResNetWithTransformer(nn.Module):
             frame_feature = self.resnet(processed_frames[:, t])  # [B, D]
             frame_features.append(frame_feature)
 
-        # 经过ResNet处理后得到frame_features [B, T, D]
+        # Step 1: 处理ResNet特征（保持不变）
         frame_features = torch.stack(frame_features, dim=1)  # [B, T, D]
-    
-        # 应用TED-Adapter
-        adapted_features = self.ted_adapter(frame_features)  # [B, T, D]
         
-        # Step 2: Transformer 融合时间信息
-        # Transformer 输入需要形状 [T, B, D]
-        adapted_features = adapted_features.permute(1, 0, 2)  # [T, B, D]
-        temporal_features = self.transformer(adapted_features)  # [T, B, D]
+        # Step 2: 使用脉冲Transformer处理时序特征 
+        # 直接调用TemporalSpikingTransformer（已包含全局池化）
+        output = self.temporal_transformer(frame_features)  # 直接输出融合特征
         
-        # Step 3: 全局特征池化
-        global_feature = temporal_features.mean(dim=0)  # [T, B, D] -> [B, D]
-        
-        return global_feature
+        return output  # 已经是最终的特征，无需额外池化
 
 class TextAdapter(nn.Module):
 
@@ -705,7 +927,6 @@ def build_model(state_dict: dict):
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 假设你有一个定义好的模型，比如 ResNetWithTransformer 或 CLIP
 
 if __name__ == "__main__":
     # 测试输入
@@ -767,3 +988,48 @@ if __name__ == "__main__":
     cosine_similarity = torch.nn.functional.cosine_similarity(video_features, text_features)
     print("Cosine similarity between video features and text features:")
     print(cosine_similarity)  # 输出每个视频和文本之间的相似度得分
+
+
+
+import torchinfo
+
+# 在测试代码的最后添加以下内容：
+
+# 1. 查看CLIP整体模型结构（需要指定两个输入）
+torchinfo.summary(
+    model,
+    input_data=(video_tensor, text_tensor),  # 直接传递真实输入张量
+    col_names=["input_size", "output_size", "num_params", "params_percent"],
+    depth=3,
+    device=device
+)
+
+# 2. 查看视觉编码器（ResNetWithTransformer）结构
+# visual_encoder_input = torch.randn(1, 25, 10, 240, 320).to(device)  # [B, T, C, H, W]
+# torchinfo.summary(
+#     model.visual,
+#     input_size=(1, 25, 10, 240, 320),
+#     col_names=["input_size", "output_size", "num_params", "params_percent"],
+#     depth=5,
+#     device=device
+# )
+
+# 3. 查看文本编码器结构
+# text_encoder_input = torch.randint(0, 49408, (1, 77)).to(device)  # [B, context_length]
+# torchinfo.summary(
+#     model.transformer,
+#     input_size=(77, 1, 256),  # 文本编码器输入形状为 [L, B, D]
+#     col_names=["input_size", "output_size", "num_params", "params_percent"],
+#     depth=5,
+#     device=device
+# )
+
+# 4. 查看TemporalSpikingTransformer结构
+# temporal_input = torch.randn(1, 25, 512).to(device)  # [B, T, D]
+# torchinfo.summary(
+#     model.visual.temporal_transformer,
+#     input_size=(1, 25, 512),
+#     col_names=["input_size", "output_size", "num_params", "params_percent"],
+#     depth=5,
+#     device=device
+# )
