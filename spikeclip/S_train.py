@@ -91,7 +91,7 @@ def plot_metrics(train_acc_i, train_acc_t, val_acc_i, val_acc_t, train_loss, val
 
 def train_and_validate(model, train_loader, val_loader):
     tokenizer = SimpleTokenizer()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=5e-4, betas=(0.9, 0.999))
 
     train_acc_i, train_acc_t = [], []
     val_acc_i, val_acc_t = [], []
