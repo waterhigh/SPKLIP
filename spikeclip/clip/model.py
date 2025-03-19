@@ -518,11 +518,12 @@ class ResidualAttentionBlock(nn.Module):
     def forward(self, x: torch.Tensor):
         # 原始流程
         x = x + self.attention(self.ln_1(x))  # 自注意力 + 残差
-        x = x + self.mlp(self.ln_2(x))         # FFN + 残差
-        
+
         # 插入TextAdapter（残差连接已包含在TextAdapter内部）
         x = self.text_adapter(x)               # 文本适配器
         
+        x = x + self.mlp(self.ln_2(x))         # FFN + 残差
+
         return x
 
 
