@@ -501,10 +501,15 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = attn_mask
         
         # 新增TextAdapter（插入在FFN之后）
-        self.text_adapter = MoETextAdapter(
+        self.text_adapter = TextAdapter(
             in_channels=d_model, 
             adapter_channels=adapter_channels
         )
+
+        # self.text_adapter = MoETextAdapter(
+        #     in_channels=d_model, 
+        #     adapter_channels=adapter_channels
+        # )
 
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
