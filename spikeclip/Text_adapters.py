@@ -6,20 +6,43 @@ from torch import nn
 class ExpertAdapter(nn.Module):
     def __init__(self, in_channels, adapter_channels, expertise="semantic"):
         super().__init__()
-        self.adapter = nn.Sequential(
+        self.expertise = expertise
+        
+        # 核心适配器（所有专家共享）
+        self.core_adapter = nn.Sequential(
             nn.Linear(in_channels, adapter_channels),
             nn.GELU(),
             nn.Linear(adapter_channels, in_channels)
         )
-        # 专家特化设计（根据需求扩展）
+        
+        # 特化模块
         if expertise == "temporal":
-            self.adapter.add_module("temporal_attn", nn.MultiheadAttention(in_channels, 1))  # 时序专家
+            self.temporal_attn = nn.MultiheadAttention(in_channels, num_heads=1)
         elif expertise == "syntax":
-            self.adapter.add_module("lstm", nn.LSTM(in_channels, adapter_channels))  # 语法专家
-        # 初始化保持一致性 
+            self.lstm = nn.LSTM(input_size=in_channels, hidden_size=adapter_channels, batch_first=True)
+        
+        # 初始化
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.constant_(m.bias, 0.)
+
+    def forward(self, x):
+        # 先通过核心适配器
+        x = self.core_adapter(x)
+        
+        # 根据专家类型应用特化模块
+        if self.expertise == "temporal":
+            # 多头注意力需要三维输入（假设x是二维的，需增加序列维度）
+            x = x.unsqueeze(0)  # [1, batch, in_channels]
+            x, _ = self.temporal_attn(x, x, x)  # 自注意力
+            x = x.squeeze(0)  # 恢复二维
+        elif self.expertise == "syntax":
+            # LSTM需要序列输入（假设x是 [batch, in_channels]，需视为长度为1的序列）
+            x = x.unsqueeze(1)  # [batch, 1, in_channels]
+            x, _ = self.lstm(x)
+            x = x.squeeze(1)  # 恢复二维
+        
+        return x
 
 class LoRAAdapter(nn.Module):
     def __init__(self, in_channels, adapter_channels, rank=16):
