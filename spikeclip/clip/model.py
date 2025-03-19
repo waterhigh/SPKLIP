@@ -1,3 +1,5 @@
+import sys
+sys.path.append('/home/bgi/code/SPKLIP/spikeclip')
 from collections import OrderedDict
 from typing import Tuple, Union
 # import math
@@ -7,6 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 import torchinfo
+from Text_adapters import *
 # from align_arch import *
 
 class Bottleneck(nn.Module):
@@ -498,7 +501,7 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = attn_mask
         
         # 新增TextAdapter（插入在FFN之后）
-        self.text_adapter = TextAdapter(
+        self.text_adapter = MoETextAdapter(
             in_channels=d_model, 
             adapter_channels=adapter_channels
         )
