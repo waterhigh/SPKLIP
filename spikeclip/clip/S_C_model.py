@@ -12,12 +12,13 @@ import torchinfo
 thresh = 0.5  # neuronal threshold
 lens = 0.5  # hyper-parameters of approximate function
 decay = 0.25  # decay constants
-num_classes = 1000
 time_window = 6
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 # define approximate firing function
 class ActFun(torch.autograd.Function):
+
     @staticmethod
     def forward(ctx, input):
         ctx.save_for_backward(input)
@@ -26,11 +27,10 @@ class ActFun(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         input, = ctx.saved_tensors
-        grad = grad_output.clone()
-        
-        # 改进后的梯度计算（避免梯度爆炸）
-        temp = torch.sigmoid(5*(thresh - input))  # 使用sigmoid替代三角波
-        return grad * temp
+        grad_input = grad_output.clone()
+        temp = abs(input - thresh) < lens
+        temp = temp / (2 * lens)
+        return grad_input * temp.float()
 
 
 act_fun = ActFun.apply
@@ -38,261 +38,240 @@ act_fun = ActFun.apply
 
 
 class mem_update(nn.Module):
+
     def __init__(self):
-        super().__init__()
-        self.decay = 0.25
-        self.register_buffer('mem', None)  # 正确注册缓存
+        super(mem_update, self).__init__()
 
     def forward(self, x):
-        """
-        输入 x 维度: [B, C, H, W]
-        输出维度: [B, C, H, W]
-        """
-        B, C, H, W = x.shape
-        
-        # 初始化膜电位（动态适配输入维度）
-        if self.mem is None or self.mem.shape != (B, C, H, W):
-            self.mem = torch.zeros(B, C, H, W, device=x.device)
-        
-        # 膜电位更新
-        self.mem = self.decay * self.mem + x
-        
-        # 脉冲生成
-        spike = ActFun.apply(self.mem)
-        self.mem = self.mem * (1 - spike.detach())
-        
-        return spike
+        mem = torch.zeros_like(x[0]).to(device)
+        spike = torch.zeros_like(x[0]).to(device)
+        output = torch.zeros_like(x)
+        mem_old = 0
+        for i in range(time_window):
+            if i >= 1:
+                mem = mem_old * decay * (1 - spike.detach()) + x[i]
+            else:
+                mem = x[i]
+            spike = act_fun(mem)
+            mem_old = mem.clone()
+            output[i] = spike
+        return output
 
-class BatchNorm2d1(nn.BatchNorm2d):
-    """阈值初始化版本"""
-    def reset_parameters(self):
-        self.reset_running_stats()
-        if self.affine:
-            nn.init.constant_(self.weight, thresh)  # 使用预设阈值初始化
-            nn.init.zeros_(self.bias)
-
-class BatchNorm2d2(nn.BatchNorm2d):
-    """零初始化版本""" 
-    def reset_parameters(self):
-        self.reset_running_stats()
-        if self.affine:
-            nn.init.constant_(self.weight, 0)  # 权重初始化为0
-            nn.init.zeros_(self.bias)
 
 class batch_norm_2d(nn.Module):
-    """适配脉冲网络的二维BN"""
+    """TDBN"""
     def __init__(self, num_features, eps=1e-5, momentum=0.1):
-        super().__init__()
-        self.bn = BatchNorm2d1(num_features, eps=eps, momentum=momentum)
+        super(batch_norm_2d, self).__init__()
+        self.bn = BatchNorm3d1(num_features)
 
-    def forward(self, x):
-        # 直接处理BCHW输入 [batch, channel, height, width]
-        return self.bn(x)
+    def forward(self, input):
+        y = input.transpose(0, 2).contiguous().transpose(0, 1).contiguous()
+        y = self.bn(y)
+        return y.contiguous().transpose(0, 1).contiguous().transpose(0, 2)
+
 
 class batch_norm_2d1(nn.Module):
-    """零初始化变体"""
+    """TDBN-Zero init"""
     def __init__(self, num_features, eps=1e-5, momentum=0.1):
-        super().__init__()
-        self.bn = BatchNorm2d2(num_features, eps=eps, momentum=momentum)
+        super(batch_norm_2d1, self).__init__()
+        self.bn = BatchNorm3d2(num_features)
 
-    def forward(self, x):
-        # 保持维度不变
-        return self.bn(x)
+    def forward(self, input):
+        y = input.transpose(0, 2).contiguous().transpose(0, 1).contiguous()
+        y = self.bn(y)
+        return y.contiguous().transpose(0, 1).contiguous().transpose(0, 2)
+
+
+class BatchNorm3d1(torch.nn.BatchNorm3d):
+
+    def reset_parameters(self):
+        self.reset_running_stats()
+        if self.affine:
+            nn.init.constant_(self.weight, thresh)
+            nn.init.zeros_(self.bias)
+
+
+class BatchNorm3d2(torch.nn.BatchNorm3d):
+
+    def reset_parameters(self):
+        self.reset_running_stats()
+        if self.affine:
+            nn.init.constant_(self.weight, 0)
+            nn.init.zeros_(self.bias)
+
 
 class Snn_Conv2d(nn.Conv2d):
-    def __init__(self, 
-                 in_channels, 
+
+    def __init__(self,
+                 in_channels,
                  out_channels,
-                 kernel_size, 
+                 kernel_size,
                  stride=1,
                  padding=0,
                  dilation=1,
                  groups=1,
                  bias=True,
                  padding_mode='zeros',
-                 thresh=0.5,
-                 decay=0.25):
-        super().__init__(
-            in_channels, out_channels, kernel_size, 
-            stride, padding, dilation, groups, bias, padding_mode
-        )
-        
-        # 注册为持久化缓冲区
-        self.register_buffer('mem', None)  # 关键修改
-        self.thresh = thresh
-        self.decay = decay
+                 marker='b'):
+        super(Snn_Conv2d,
+              self).__init__(in_channels, out_channels, kernel_size, stride,
+                             padding, dilation, groups, bias, padding_mode)
+        self.marker = marker
 
-    def forward(self, x):
-        # 执行卷积
-        conv_out = F.conv2d(
-            x, self.weight, self.bias, 
-            self.stride, self.padding,
-            self.dilation, self.groups
-        )
-        
-        # 动态初始化膜电位
-        if self.mem is None or self.mem.shape != conv_out.shape:
-            self.mem = torch.zeros_like(conv_out, device=x.device)
-            self.register_buffer('mem', self.mem)  # 重新注册更新后的缓冲区
-        
-        # 膜电位更新
-        self.mem = self.decay * self.mem + conv_out
-        
-        # 脉冲生成
-        spike = ActFun.apply(self.mem)  # 关键修改点
-        self.mem = self.mem * (1 - spike.detach())
-        
-        return spike
+    def forward(self, input):
+        weight = self.weight
+        h = (input.size()[3] - self.kernel_size[0] +
+             2 * self.padding[0]) // self.stride[0] + 1
+        w = (input.size()[4] - self.kernel_size[0] +
+             2 * self.padding[0]) // self.stride[0] + 1
+        c1 = torch.zeros(time_window,
+                         input.size()[1],
+                         self.out_channels,
+                         h,
+                         w,
+                         device=input.device)
+        for i in range(time_window):
+            c1[i] = F.conv2d(input[i], weight, self.bias, self.stride,
+                             self.padding, self.dilation, self.groups)
+        return c1
     
 class Bottleneck(nn.Module):
     expansion = 4
 
     def __init__(self, inplanes, planes, stride=1):
         super().__init__()
-        # 卷积层替换为脉冲版本
-        self.conv1 = Snn_Conv2d(inplanes, planes, 1, bias=False)
+        # 主路径卷积全部使用 stride=1，下采样改由 avgpool 完成
+        self.conv1 = Snn_Conv2d(inplanes, planes, kernel_size=1, stride=1, bias=False)
         self.bn1 = batch_norm_2d(planes)
         
-        self.conv2 = Snn_Conv2d(planes, planes, 3, padding=1, bias=False)
+        self.conv2 = Snn_Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn2 = batch_norm_2d(planes)
         
-        self.avgpool = nn.AvgPool2d(stride) if stride > 1 else nn.Identity()
+        self.avgpool = nn.AvgPool3d(kernel_size=(1, stride, stride)) if stride > 1 else nn.Identity()
         
-        self.conv3 = Snn_Conv2d(planes, planes * self.expansion, 1, bias=False)
+        self.conv3 = Snn_Conv2d(planes, planes * self.expansion, kernel_size=1, stride=1, bias=False)
         self.bn3 = batch_norm_2d(planes * self.expansion)
         
-        # 膜电位管理器
-        self.mem_manager = mem_update()
-        
-        # 下采样调整
+        self.mem_update = mem_update()
+
+        # 下采样路径同样使用 avgpool 下采样
         self.downsample = None
-        self.stride = stride
         if stride > 1 or inplanes != planes * self.expansion:
-            self.downsample = nn.Sequential(OrderedDict([
-                ("-1", nn.AvgPool2d(stride)),
-                ("0", Snn_Conv2d(inplanes, planes * self.expansion, 1, bias=False)),
-                ("1", batch_norm_2d(planes * self.expansion))
-            ]))
+            self.downsample = nn.Sequential(
+                Snn_Conv2d(inplanes, planes * self.expansion, kernel_size=1, stride=1, bias=False),
+                nn.AvgPool3d(kernel_size=(1, stride, stride)),
+                batch_norm_2d(planes * self.expansion)
+            )
 
     def forward(self, x):
         identity = x
         
-        # 脉冲特征提取
         out = self.conv1(x)
         out = self.bn1(out)
-        out = self.mem_manager(out)
-        
         out = self.conv2(out)
         out = self.bn2(out)
-        out = self.mem_manager(out)
-        out = self.avgpool(out)
-        
+        out = self.avgpool(out)  # 主路径下采样
         out = self.conv3(out)
         out = self.bn3(out)
-        
-        # 残差连接
+        out = self.mem_update(out)
+
         if self.downsample is not None:
-            identity = self.downsample(x)
-        
-        # 膜电位相加
-        out += identity
-        return self.mem_manager(out)
+            identity = self.downsample(x)  # 下采样路径也通过 avgpool
+
+        out += identity  # 此时维度一致
+        return out
 
 class AttentionPool2d(nn.Module):
-    def __init__(self, spacial_dim, embed_dim, num_heads, output_dim=None):
+    def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
         super().__init__()
-        self.spacial_size = spacial_dim ** 2
-        self.embed_dim = embed_dim
-        
-        # 位置编码初始化 (保持4D结构)
-        self.positional_embedding = nn.Parameter(
-            torch.randn(1, embed_dim, spacial_dim, spacial_dim)  # [1, D, H, W]
-        )
-        
-        # 位置编码处理 (保持空间结构)
-        self.pos_encoder = nn.Sequential(
-            Snn_Conv2d(embed_dim, embed_dim, 3, padding=1),
-            mem_update()
-        )
-        
-        # 注意力模块 (兼容空间结构)
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.1)
-        self.proj = Snn_Conv2d(embed_dim, output_dim or embed_dim, 1)
-        self.mem = mem_update()
+        # 初始化 positional_embedding
+        self.positional_embedding = nn.Parameter(torch.randn(spacial_dim ** 2 + 1, embed_dim) / embed_dim ** 0.5)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.c_proj = nn.Linear(embed_dim, output_dim or embed_dim)
+        self.num_heads = num_heads
 
     def forward(self, x):
-        """
-        输入形状: [B, C, H, W]
-        输出形状: [B, output_dim]
-        """
-        # 保留原始空间维度
-        B, C, H, W = x.shape
+        # Flatten the input tensor: (B, C, H, W) -> (HW, B, C)
+        x = x.flatten(start_dim=2).permute(2, 0, 1)  # (HW, B, C)
         
-        # 位置编码融合 (保持4D)
-        pos_emb = self.pos_encoder(self.positional_embedding)
-        x = x + pos_emb  # [B, C, H, W] + [1, D, H, W]
-        
-        # 空间维度展平 (不改变张量维度数)
-        x_flat = x.flatten(2)  # [B, C, H*W]
-        
-        # 添加分类token
-        cls_token = x.mean(dim=(2,3), keepdim=True)  # [B, C, 1, 1]
-        x = torch.cat([cls_token, x_flat], dim=2)     # [B, C, H*W+1]
-        
-        # 调整维度为注意力输入格式 [Seq, B, Dim]
-        x = x.permute(2, 0, 1)  # [H*W+1, B, C]
-        
-        # 脉冲注意力计算
-        attn_output, _ = self.attn(
-            query=x[:1],  # 仅用cls_token作为query
-            key=x,
-            value=x
+        # Concatenate mean value as the first token
+        x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1, B, C)
+
+        # Get the spatial size
+        spatial_dim = x.shape[0]  # This is the number of tokens (HW+1)
+
+        # Ensure positional embedding matches the spatial dimension of the input
+        positional_embedding = self.positional_embedding[:spatial_dim, :]
+
+        # Add positional embedding to the input
+        x = x + positional_embedding[:, None, :].to(x.dtype)
+
+        # Apply multi-head attention
+        x, _ = F.multi_head_attention_forward(
+            query=x[:1], key=x, value=x,
+            embed_dim_to_check=x.shape[-1],
+            num_heads=self.num_heads,
+            q_proj_weight=self.q_proj.weight,
+            k_proj_weight=self.k_proj.weight,
+            v_proj_weight=self.v_proj.weight,
+            in_proj_weight=None,
+            in_proj_bias=torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias]),
+            bias_k=None,
+            bias_v=None,
+            add_zero_attn=False,
+            dropout_p=0.1,
+            out_proj_weight=self.c_proj.weight,
+            out_proj_bias=self.c_proj.bias,
+            use_separate_proj_weight=True,
+            training=self.training,
+            need_weights=False
         )
-        
-        # 投影输出
-        output = self.proj(attn_output.permute(1, 2, 0).unsqueeze(-1))  # [B, D, 1, 1]
-        return self.mem(output.squeeze(-1).squeeze(-1))  # [B, output_dim]
+        return x.squeeze(0)
 
 
-# 修改，不使用attentionpooling
+
 class ModifiedResNet(nn.Module):
-    def __init__(self, layers, output_dim, heads, input_resolution, width, input_channels=320):
+    def __init__(self, layers, output_dim, heads, input_resolution, width, input_channels=64):
         super().__init__()
-        # 初始化卷积层
-        self.conv1 = Snn_Conv2d(input_channels, width//2, kernel_size=3, stride=2, padding=1)
-        self.bn1 = batch_norm_2d(width//2)
+        self.output_dim = output_dim
+        self.input_resolution = input_resolution
+
+        # 修改1：替换为SNN兼容的3-layer stem
+        self.conv1 = Snn_Conv2d(input_channels, width//2, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1 = batch_norm_2d(width//2)  # TDBN
         
-        self.conv2 = Snn_Conv2d(width//2, width//2, kernel_size=3, padding=1)
+        self.conv2 = Snn_Conv2d(width//2, width//2, kernel_size=3, padding=1, bias=False)
         self.bn2 = batch_norm_2d(width//2)
         
-        self.conv3 = Snn_Conv2d(width//2, width, kernel_size=3, padding=1)
+        self.conv3 = Snn_Conv2d(width//2, width, kernel_size=3, padding=1, bias=False)
         self.bn3 = batch_norm_2d(width)
-        
-        # 下采样组件
-        self.avgpool = nn.AvgPool2d(2)
-        self.mem_pool = mem_update()
-        
-        # 残差层配置
-        self._inplanes = width
-        self.layer1 = self._make_layer(width, layers[0])
-        self.layer2 = self._make_layer(width*2, layers[1], stride=2)
-        self.layer3 = self._make_layer(width*4, layers[2], stride=2)
-        self.layer4 = self._make_layer(width*8, layers[3], stride=2)
-        
-        # 最终池化层（关键修正部分）
-        self.final_pool = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),  # [B, C, 1, 1]
-            Snn_Conv2d(
-                in_channels=width * 32,  # 计算方式：width*8 * Bottleneck.expansion(4)
-                out_channels=output_dim,
-                kernel_size=1
-            ),  # [B, output_dim, 1, 1]
-            mem_update(),
-            nn.Flatten(start_dim=1)  # [B, output_dim]
 
+        self.mem_update_stem = mem_update()  # 添加脉冲激活
+        self.avgpool = nn.AvgPool3d(kernel_size=(1,2,2))  # 修改为3D池化
+
+        # 修改2：残差层适配SNN
+        self._inplanes = width
+        self.layer1 = self._make_snn_layer(width, layers[0])
+        self.layer2 = self._make_snn_layer(width*2, layers[1], stride=2)
+        self.layer3 = self._make_snn_layer(width*4, layers[2], stride=2)
+        self.layer4 = self._make_snn_layer(width*8, layers[3], stride=2)
+
+        # 修改3：SNN兼容的注意力池化
+        h, w = input_resolution
+        spatial_dim_h = h // 32
+        spatial_dim_w = w // 32
+        embed_dim = width * 32
+
+        self.final_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),  # 全局平均池化 (也可换成nn.AdaptiveMaxPool2d)
+            nn.Flatten(),
+            nn.Linear(width * 8 * Bottleneck.expansion, output_dim)  # 注意输入维度匹配
         )
 
-    def _make_layer(self, planes, blocks, stride=1):
+    def _make_snn_layer(self, planes, blocks, stride=1):
+        """创建SNN兼容的残差层"""
         layers = [Bottleneck(self._inplanes, planes, stride)]
         self._inplanes = planes * Bottleneck.expansion
         for _ in range(1, blocks):
@@ -300,186 +279,162 @@ class ModifiedResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        # 添加维度校验点
-        def validate_shape(tensor, expected_dims):
-            if tensor.dim() != expected_dims:
-                raise ValueError(f"维度错误: 期望{expected_dims}D，实际得到{tensor.dim()}D张量")
-
-        # 预处理阶段
+        # 输入维度扩展：添加时间窗口 [T,B,C,H,W]
+        x = x.unsqueeze(0).expand(time_window, *(-1,)*4)  # [T,B,C,H,W]
+        
         def stem(x):
-            x = self.conv1(x)
-            validate_shape(x, 4)
-            x = self.bn1(x)
-            x = self.mem_pool(x)
-            
-            x = self.conv2(x)
+            x = self.conv1(x)       # [T,B,C,H,W]
+            x = self.bn1(x)         # TDBN处理
+            x = self.conv2(x)       # [T,B,C,H,W]
             x = self.bn2(x)
-            x = self.mem_pool(x)
-            
-            x = self.conv3(x)
+            x = self.conv3(x)       # [T,B,C,H,W]
             x = self.bn3(x)
-            x = self.avgpool(x)
-            return self.mem_pool(x)
-        
-        # 主流程
-        x = stem(x)
-        validate_shape(x, 4)
-        
-        x = self.layer1(x)
-        # print("Layer1输出形状:", x.shape)
-        validate_shape(x, 4)
-        
+            x = self.avgpool(x)     # 时间维度保留
+            return self.mem_update_stem(x)  # 脉冲激活
+
+        x = x.type(self.conv1.weight.dtype)  # 确保数据类型匹配
+        x = stem(x)                 # [T,B,C,H,W]
+        x = self.layer1(x)          # [T,B,C,H,W]
         x = self.layer2(x)
-        # print("Layer2输出形状:", x.shape)
-        validate_shape(x, 4)
-        
         x = self.layer3(x)
-        validate_shape(x, 4)
-        
         x = self.layer4(x)
-        # print("Layer4输出形状:", x.shape)
-        validate_shape(x, 4)
         
-        return self.final_pool(x)
+        # 时空特征聚合
+        x = x.mean(dim=0)           # 时间维度平均 [B,output_dim]
+        x = self.final_pool(x)        # [B,output_dim]
+           
+        return x
     
 class BasicBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, features):
         super().__init__()
-        # 确保输出通道数一致
-        self.conv1 = Snn_Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.mem_update1 = mem_update()
+        # 所有卷积替换为SNN兼容版本
+        self.conv1 = Snn_Conv2d(features, features, kernel_size=3, padding=1, bias=True)
+        self.bn1 = batch_norm_2d(features)
         
-        self.conv2 = Snn_Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.mem_update2 = mem_update()
+        self.conv2 = Snn_Conv2d(features, features, kernel_size=3, padding=1, bias=True)
+        self.bn2 = batch_norm_2d(features)
         
-        # 残差路径通道对齐
-        if in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                Snn_Conv2d(in_channels, out_channels, kernel_size=1),
-                mem_update()
-            )
-        else:
-            self.shortcut = nn.Identity()
+        self.conv3 = Snn_Conv2d(features, features, kernel_size=3, padding=1, bias=True)
+        self.bn3 = batch_norm_2d(features)
+        
+        self.mem_update = mem_update()  # 脉冲激活层
 
     def forward(self, x):
-        identity = self.shortcut(x)
+        # 输入形状: [T=6, B, C, H, W]
+        identity = x
         
-        out = self.conv1(x)
-        out = self.mem_update1(out)
+        out = self.conv1(x)       # [6,B,C,H,W]
+        out = self.bn1(out)
+        out = self.mem_update(out)
         
         out = self.conv2(out)
-        out = self.mem_update2(out)
+        out = self.bn2(out)
+        out = self.mem_update(out)
         
-        # 确保维度匹配
-        assert out.shape == identity.shape, f"维度不匹配: {out.shape} vs {identity.shape}"
-        return out + identity
+        out = self.conv3(out)
+        out = self.bn3(out)
+        
+        return self.mem_update(out + identity)
 
-class SurrogateSigmoid(torch.autograd.Function):
-    """使用替代梯度保持可微性"""
-    @staticmethod
-    def forward(ctx, x):
-        ctx.save_for_backward(x)
-        return x.gt(0).float()  # 硬Sigmoid
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, = ctx.saved_tensors
-        grad = 1 / (1 + torch.abs(x))  # 替代梯度
-        return grad_output * grad
-
-# 修正后的CALayer2实现
 class CALayer2(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
-        self.ca_block = nn.Sequential(
-            Snn_Conv2d(in_channels, in_channels*2, 3, padding=1, bias=True),
-            mem_update(),
-            Snn_Conv2d(in_channels*2, in_channels, 3, padding=1, bias=True),
-            SurrogateSigmoidWrapper()  # 使用包装后的模块
-        )
+        # 注意力模块SNN化
+        self.ca_conv1 = Snn_Conv2d(in_channels, in_channels*2, 3, padding=1)
+        self.bn1 = batch_norm_2d(in_channels*2)
+        self.ca_conv2 = Snn_Conv2d(in_channels*2, in_channels, 3, padding=1)
+        self.bn2 = batch_norm_2d(in_channels)
+        self.mem_update_sigmoid = mem_update()  # 用脉冲近似Sigmoid
 
     def forward(self, x):
-        weight = self.ca_block(x)
-        return weight
-
-# 将Function包装成Module子类
-class SurrogateSigmoidWrapper(nn.Module):
-    def __init__(self):
-        super().__init__()
+        # x形状: [T,B,C,H,W]
+        T, B, C, H, W = x.shape
+        # 时间维度平均聚合
+        x_mean = x.mean(dim=0)  # [B,C,H,W]
+        x_mean = x_mean.unsqueeze(0).expand(T, B, C, H, W)  # 广播回[T,B,C,H,W]
         
-    def forward(self, x):
-        return SurrogateSigmoid.apply(x)  # 调用Function的apply方法
+        weight = self.ca_conv1(x_mean)
+        weight = self.bn1(weight)
+        weight = self.mem_update_sigmoid(weight)
+        
+        weight = self.ca_conv2(weight)
+        weight = self.bn2(weight)
+        return self.mem_update_sigmoid(weight)  # 模拟Sigmoid激活
     
 
 class FeatureExtractor(nn.Module):
-    def __init__(
-        self, in_channels, features, out_channels, channel_step, num_of_layers=16
-    ):
-        super(FeatureExtractor, self).__init__()
+    def __init__(self, in_channels, features, out_channels, channel_step, num_of_layers=16):
+        super().__init__()
         self.channel_step = channel_step
-        self.conv0_0 = Snn_Conv2d(
-            in_channels=in_channels, out_channels=16, kernel_size=3, padding=1
-        )
-        self.conv0_1 = Snn_Conv2d(
-            in_channels=in_channels - 2 * channel_step,
-            out_channels=16, kernel_size=3, padding=1
-        )
-        self.conv0_2 = Snn_Conv2d(
-            in_channels=in_channels - 4 * channel_step,
-            out_channels=16, kernel_size=3, padding=1
-        )
-        self.conv0_3 = Snn_Conv2d(
-            in_channels=in_channels - 6 * channel_step,
-            out_channels=16, kernel_size=3, padding=1
-        )
-        self.conv1_0 = Snn_Conv2d(
-            in_channels=16, out_channels=1, kernel_size=3, padding=1
-        )
-        self.conv1_1 = Snn_Conv2d(
-            in_channels=16, out_channels=1, kernel_size=3, padding=1
-        )
-        self.conv1_2 = Snn_Conv2d(
-            in_channels=16, out_channels=1, kernel_size=3, padding=1
-        )
-        self.conv1_3 = Snn_Conv2d(
-            in_channels=16, out_channels=1, kernel_size=3, padding=1
-        )
+        self.time_window = 6  # 新增时间维度参数
+        
+        # 初始卷积组SNN化
+        self.conv0_0 = Snn_Conv2d(in_channels, 16, kernel_size=3, padding=1)
+        self.bn0_0 = batch_norm_2d(16)
+        self.mem_update_conv0_0 = mem_update()
+        
+        self.conv0_1 = Snn_Conv2d(in_channels-2*channel_step, 16, kernel_size=3, padding=1)
+        self.bn0_1 = batch_norm_2d(16)
+        self.mem_update_conv0_1 = mem_update()
+        
+        self.conv0_2 = Snn_Conv2d(in_channels-4*channel_step, 16, kernel_size=3, padding=1)
+        self.bn0_2 = batch_norm_2d(16)
+        self.mem_update_conv0_2 = mem_update()
+        
+        self.conv0_3 = Snn_Conv2d(in_channels-6*channel_step, 16, kernel_size=3, padding=1)
+        self.bn0_3 = batch_norm_2d(16)
+        self.mem_update_conv0_3 = mem_update()
+        
+        # 第二层卷积SNN化
+        self.conv1_0 = Snn_Conv2d(16, 1, kernel_size=3, padding=1)
+        self.conv1_1 = Snn_Conv2d(16, 1, kernel_size=3, padding=1)
+        self.conv1_2 = Snn_Conv2d(16, 1, kernel_size=3, padding=1)
+        self.conv1_3 = Snn_Conv2d(16, 1, kernel_size=3, padding=1)
+        
         self.ca = CALayer2(in_channels=4)
-        self.conv = Snn_Conv2d(
-            in_channels=4, out_channels=features, kernel_size=3, padding=1
-        )
-        self.relu = mem_update()
+        self.conv = Snn_Conv2d(4, features, kernel_size=3, padding=1)
+        self.bn_conv = batch_norm_2d(features)
+        self.mem_update_main = mem_update()
+        
+        # 构建SNN残差块
         layers = []
         for _ in range(num_of_layers - 2):
-            layers.append(BasicBlock(in_channels=features, out_channels=features))
+            layers.append(BasicBlock(features))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
-        out_0 = self.conv1_0(self.relu(self.conv0_0(x)))
-        out_1 = self.conv1_1(
-            self.relu(self.conv0_1(x[:, self.channel_step : -self.channel_step, :, :]))
-        )
-        out_2 = self.conv1_2(
-            self.relu(
-                self.conv0_2(x[:, 2 * self.channel_step : -2 * self.channel_step, :, :])
-            )
-        )
-        out_3 = self.conv1_3(
-            self.relu(
-                self.conv0_3(x[:, 3 * self.channel_step : -3 * self.channel_step, :, :])
-            )
-        )
-        out = torch.cat((out_0, out_1), 1)
-        out = torch.cat((out, out_2), 1)
-        out = torch.cat((out, out_3), 1)
+        # 输入维度扩展: [1,61,240,320] -> [6,1,61,240,320]
+        x = x.unsqueeze(0).expand(self.time_window, -1, -1, -1, -1)
+        
+        # 第一组卷积处理
+        out0 = self.mem_update_conv0_0(self.bn0_0(self.conv0_0(x)))
+        out1 = self.mem_update_conv0_1(self.bn0_1(self.conv0_1(x[:, :, self.channel_step:-self.channel_step])))
+        out2 = self.mem_update_conv0_2(self.bn0_2(self.conv0_2(x[:, :, 2*self.channel_step:-2*self.channel_step])))
+        out3 = self.mem_update_conv0_3(self.bn0_3(self.conv0_3(x[:, :, 3*self.channel_step:-3*self.channel_step])))
+        
+        # 第二层卷积
+        out0 = self.conv1_0(out0)
+        out1 = self.conv1_1(out1)
+        out2 = self.conv1_2(out2)
+        out3 = self.conv1_3(out3)
+        
+        # 拼接与注意力
+        out = torch.cat([out0, out1, out2, out3], dim=2)  # 在通道维度拼接
         est = out
         weight = self.ca(out)
-        out = weight * out
-        out = self.conv(out)
-        out = self.relu(out)
+        out = weight * out  # 注意力加权
+        
+        # 主路径处理
+        out = self.mem_update_main(self.bn_conv(self.conv(out)))
         tmp = out
         out = self.net(out)
-        return out + tmp, est
+
+        out = out + tmp
+        out = out.mean(dim=0)  # [1,64,240,320]
+        est = est.mean(dim=0)
+
+        return out, est
 
 
 import torch
@@ -557,7 +512,7 @@ class ResNetWithTransformer(nn.Module):
             block4_out, est4 = self.extractor(block4)
             block_out = torch.stack([block0_out, block1_out, block2_out, block3_out, block4_out], dim=0)  # [5, 64, H, W]
             block_out = block_out.squeeze(1) 
-            ##block_out = block_out.view(1, 5 * 64, H, W)
+            # block_out = block_out.view(1, 5 * 64, H, W)
             processed_blocks.append(block_out.unsqueeze(0))  # [1, 5,64, H, W]
         processed_frames = torch.cat(processed_blocks, dim=0)  # [B, 5,64, H, W]
         processed_frames =processed_frames.squeeze(1) 
@@ -859,8 +814,8 @@ if __name__ == "__main__":
     text_tensor = torch.randint(0, vocab_size, (batch_size, context_length)).to(device)  # 移动到 GPU
 
     # 模型参数
-    embed_dim = 512  # 嵌入维度
-    vision_layers = (3, 4, 6, 3)  # ResNet 的层数配置
+    embed_dim = 256  # 嵌入维度
+    vision_layers = (2, 2, 2, 2)  # ResNet 的层数配置
     vision_width = 64
     transformer_width = 256
     transformer_heads = 4
