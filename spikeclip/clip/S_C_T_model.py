@@ -7,12 +7,13 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 import torchinfo
+from S_T import *
 # from align_arch import *
 
 thresh = 0.5  # neuronal threshold
 lens = 0.5  # hyper-parameters of approximate function
 decay = 0.25  # decay constants
-time_window = 6
+time_window = 2
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -459,16 +460,24 @@ class ResNetWithTransformer(nn.Module):
             input_channels=input_channels
         )
         
-        # Transformer 部分
-        self.transformer = TransformerEncoder(
-            TransformerEncoderLayer(
-                d_model=frame_feature_dim,  # 帧级特征的维度
-                nhead=transformer_heads,
-                dim_feedforward=frame_feature_dim * 4,  # 前馈网络的维度
-                dropout=0.1
-            ),
-            num_layers=transformer_layers
-        )
+        # # Transformer 部分
+        # self.transformer = TransformerEncoder(
+        #     TransformerEncoderLayer(
+        #         d_model=frame_feature_dim,  # 帧级特征的维度
+        #         nhead=transformer_heads,
+        #         dim_feedforward=frame_feature_dim * 4,  # 前馈网络的维度
+        #         dropout=0.1
+        #     ),
+        #     num_layers=transformer_layers
+        # )
+
+        # spiking-transformer
+        self.transformer = PureSpikeTransformer(
+                input_dim=frame_feature_dim, 
+                num_heads=transformer_heads,  
+                num_layers=transformer_layers   
+            )
+        
 
         # Feature Extractor 部分
         self.extractor = FeatureExtractor(
@@ -476,7 +485,7 @@ class ResNetWithTransformer(nn.Module):
             features=64, 
             out_channels=64, 
             channel_step=1, 
-            num_of_layers=8
+            num_of_layers=3
         )
         self.win_r = 30  # 窗口半径
         self.win_step = 45  # 窗口步长
@@ -524,10 +533,7 @@ class ResNetWithTransformer(nn.Module):
 
         # 经过ResNet处理后得到frame_features [B, T, D]
         frame_features = torch.stack(frame_features, dim=1)  # [B, T, D]
-    
-        # 应用TED-Adapter
-        # adapted_features = self.ted_adapter(frame_features)  # [B, T, D]
-        
+          
         # Step 2: Transformer 融合时间信息
         # Transformer 输入需要形状 [T, B, D]
         frame_features = frame_features.permute(1, 0, 2)  # [T, B, D]
@@ -840,30 +846,38 @@ if __name__ == "__main__":
     print(f"Video input shape: {video_tensor.shape}")  # 预期形状: [B, T, C, H, W]
     print(f"Text input shape: {text_tensor.shape}")  # 预期形状: [B, context_length]
 
-    # 获取视频和文本的对比学习结果
-    logits_per_video, logits_per_text = model(video_tensor, text_tensor)
 
-    print("Output dimensions:")
-    print(f"logits_per_video shape: {logits_per_video.shape}")  # 预期形状: [B, B] 代表视频与文本之间的相似度
-    print(f"logits_per_text shape: {logits_per_text.shape}")    # 预期形状: [B, B] 代表文本与视频之间的相似度
+    # 节省40%显存，精度损失<0.5%（网页5的推荐方案）
+
+    from torch.cuda.amp import autocast
+    with autocast():
+    # 获取视频和文本的对比学习结果
+        logits_per_video, logits_per_text = model(video_tensor, text_tensor)
+
+        print("Output dimensions:")
+        print(f"logits_per_video shape: {logits_per_video.shape}")  # 预期形状: [B, B] 代表视频与文本之间的相似度
+        print(f"logits_per_text shape: {logits_per_text.shape}")    # 预期形状: [B, B] 代表文本与视频之间的相似度
 
     # 提取视频特征和文本特征
-    video_features = model.encode_image(video_tensor)
-    text_features = model.encode_text(text_tensor)
+        video_features = model.encode_image(video_tensor)
+        text_features = model.encode_text(text_tensor)
 
-    print("Intermediate feature dimensions:")
-    print(f"Video features shape: {video_features.shape}")  # 预期形状: [B, embed_dim]
-    print(f"Text features shape: {text_features.shape}")    # 预期形状: [B, embed_dim]
+        print("Intermediate feature dimensions:")
+        print(f"Video features shape: {video_features.shape}")  # 预期形状: [B, embed_dim]
+        print(f"Text features shape: {text_features.shape}")    # 预期形状: [B, embed_dim]
 
     # 计算视频和文本之间的余弦相似度
-    cosine_similarity = torch.nn.functional.cosine_similarity(video_features, text_features)
-    print("Cosine similarity between video features and text features:")
-    print(cosine_similarity)  # 输出每个视频和文本之间的相似度得分
+        cosine_similarity = torch.nn.functional.cosine_similarity(video_features, text_features)
+        print("Cosine similarity between video features and text features:")
+        print(cosine_similarity)  # 输出每个视频和文本之间的相似度得分
 
-    torchinfo.summary(
-    model,
-    input_data=(video_tensor, text_tensor),  # 直接传递真实输入张量
-    col_names=["input_size", "output_size", "num_params", "params_percent"],
-    depth=3,
-    device=device
-)
+        torchinfo.summary(
+        model,
+        input_data=(video_tensor, text_tensor),  # 直接传递真实输入张量
+        col_names=["input_size", "output_size", "num_params", "params_percent"],
+        depth=3,
+        device=device
+        )
+        
+        max_mem = torch.cuda.max_memory_allocated() / 1024**2  
+        print(f"最大显存占用：{max_mem:.2f} MB")
